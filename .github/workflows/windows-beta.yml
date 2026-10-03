@@ -1,0 +1,78 @@
+name: Desktop beta — Windows
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Read encrypted build snapshot
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FLAMES_SOURCE_KEY: ${{ secrets.FLAMES_SOURCE_KEY }}
+        run: |
+          gh release download desktop-beta-encrypted-source-20261003 --repo $env:GITHUB_REPOSITORY --pattern 'windows-source*'
+          if ($LASTEXITCODE -ne 0) { throw 'Encrypted snapshot download failed' }
+          $env:FLAMES_SOURCE_KEY | & 'C:/Program Files/Git/usr/bin/openssl.exe' enc -d -aes-256-cbc -pbkdf2 -in windows-source.enc -out windows-source.tar.gz -pass stdin
+          if ($LASTEXITCODE -ne 0) { throw 'Build snapshot decryption failed' }
+          Remove-Item Env:FLAMES_SOURCE_KEY
+          $expected = ((Get-Content windows-source.sha256).Split(' ')[0]).ToLowerInvariant()
+          if ((Get-FileHash windows-source.tar.gz -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Source snapshot checksum mismatch' }
+          tar -xzf windows-source.tar.gz
+          if ($LASTEXITCODE -ne 0) { throw 'Source snapshot extraction failed' }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-desktop-beta
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Install installer compiler
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+      - name: Prepare signing certificate if configured
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.FLAMES_WINDOWS_PFX_BASE64 }}
+        run: |
+          if ($env:PFX_BASE64) {
+            $path = Join-Path $env:RUNNER_TEMP 'flames-signing.pfx'
+            [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:PFX_BASE64))
+            "FLAMES_WINDOWS_PFX_PATH=$path" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+      - name: Build and package Windows desktop beta
+        shell: pwsh
+        env:
+          FLAMES_WINDOWS_PFX_PASSWORD: ${{ secrets.FLAMES_WINDOWS_PFX_PASSWORD }}
+        run: ./scripts/windows/package-beta.ps1
+      - name: Install and launch smoke test
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem build/distribution/windows/installer/*setup.exe | Select-Object -First 1).FullName
+          $destination = Join-Path $env:RUNNER_TEMP 'flames-installed'
+          $install = Start-Process $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$destination`"") -PassThru -Wait
+          if ($install.ExitCode -ne 0) { throw "Installer failed: $($install.ExitCode)" }
+          python scripts/release/smoke-ffi.py $destination
+          if ($LASTEXITCODE -ne 0) { throw 'Installed native library smoke test failed' }
+          $app = Start-Process (Join-Path $destination 'FlamesStudio.exe') -PassThru
+          Start-Sleep -Seconds 12
+          if ($app.HasExited) { throw "Desktop app exited at startup: $($app.ExitCode)" }
+          Stop-Process $app.Id
+          $uninstall = Start-Process (Join-Path $destination 'unins000.exe') -ArgumentList '/VERYSILENT', '/NORESTART' -PassThru -Wait
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed: $($uninstall.ExitCode)" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flames-studio-windows-beta
+          path: build/distribution/windows/installer/*
+          if-no-files-found: error
+      - name: Remove temporary certificate
+        if: always()
+        shell: pwsh
+        run: Remove-Item (Join-Path $env:RUNNER_TEMP 'flames-signing.pfx') -ErrorAction SilentlyContinue
